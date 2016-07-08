@@ -161,6 +161,20 @@ def _add_deploy_arguments(config, parser):
     )
 
 
+def _add_frontend_arguments(config, parser):
+    frontend_group = parser.add_argument_group(
+        title="output display",
+    )
+
+    frontend_group.add_argument(
+        "-f",
+        default='HeadfulFrontend',
+        help="name of the frontend class to use",
+        metavar="MyFrontendClass",
+        dest="frontend_class",
+    )
+
+
 def make_arg_parser(config):
     parser = argparse.ArgumentParser(
         description="roll stuff to servers",
@@ -171,6 +185,7 @@ def make_arg_parser(config):
     _add_iteration_arguments(config, parser)
     _add_flags(config, parser)
     _add_deploy_arguments(config, parser)
+    _add_frontend_arguments(config, parser)
 
     return parser
 

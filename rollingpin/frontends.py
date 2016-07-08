@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import division
 
 import collections
@@ -39,6 +40,16 @@ def colorize(text, color):
     return start + text + "\033[0m"
 
 
+def at_position(text, row, col):
+    # From the top left corner.  Numbering starts at 1.
+    start = "\033[%d;%dH" % (row, col)
+    return start + text
+
+
+def clear_screen():
+    return "\033[2J"
+
+
 COLOR_BY_LOGLEVEL = {
     logging.DEBUG: Color.WHITE,
     logging.INFO: Color.BOLD(Color.WHITE),
@@ -63,13 +74,13 @@ class HostFormatter(logging.Formatter):
 
 
 class HeadlessFrontend(object):
-    def __init__(self, event_bus, hosts, verbose_logging):
+    def __init__(self, event_bus, hosts, args):
         longest_hostname = max(len(host) for host in hosts)
 
         formatter = HostFormatter(longest_hostname)
         self.log_handler = logging.StreamHandler()
         self.log_handler.setFormatter(formatter)
-        if verbose_logging:
+        if args.verbose_logging:
             self.enable_verbose_logging()
         else:
             self.disable_verbose_logging()
@@ -206,8 +217,8 @@ class StdioListener(Protocol):
 
 
 class HeadfulFrontend(HeadlessFrontend):
-    def __init__(self, event_bus, hosts, verbose_logging, pause_after):
-        HeadlessFrontend.__init__(self, event_bus, hosts, verbose_logging)
+    def __init__(self, event_bus, hosts, args):
+        HeadlessFrontend.__init__(self, event_bus, hosts, args)
 
         self.console_input = StdioListener()
         StandardIO(self.console_input)
@@ -217,7 +228,7 @@ class HeadfulFrontend(HeadlessFrontend):
             "deploy.enqueue": self.on_enqueue,
         })
 
-        self.pause_after = pause_after
+        self.pause_after = args.pause_after
         self.enqueued_hosts = 0
 
     def on_sleep(self, host, count):
@@ -275,3 +286,164 @@ class HeadfulFrontend(HeadlessFrontend):
                 break
 
         self.enqueued_hosts = 0
+
+
+class OrderedDefaultDict(collections.OrderedDict, collections.defaultdict):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        super(OrderedDefaultDict, self).__init__(*args, **kwargs)
+        self.default_factory = default_factory
+
+
+class AnimatedFrontend(HeadfulFrontend):
+
+    def __init__(self, event_bus, hosts, args):
+        super(AnimatedFrontend, self).__init__(event_bus, hosts, args)
+        self.parallel = args.parallel
+        event_bus.register({
+            "host.begin": self.on_host_begin,
+            "render": self.on_render,
+        })
+
+        # Keep track of rendering state
+        self.host_ticks = OrderedDefaultDict(lambda: 0)
+
+    @inlineCallbacks
+    def on_enqueue(self, deploys):
+        # the deployer has added a host to the queue to deploy to
+        self.enqueued_hosts += 1
+
+        # we won't pause the action if we're near the end or have room for more
+        completed_hosts = self.count_completed_hosts()
+        if completed_hosts + self.pause_after >= self.count_hosts():
+            return
+
+        if not self.pause_after or self.enqueued_hosts < self.pause_after:
+            return
+
+        # wait for outstanding hosts to finish up
+        yield DeferredList(deploys, consumeErrors=True)
+
+        # prompt the user for what to do now
+        while True:
+
+            # Signal to renderer that we should show the main prompt
+            self.needs_main_prompt = True
+            c = yield self.console_input.read_character()
+            self.needs_main_prompt = False
+
+            if c == "a":
+                self.pause_after = 0
+                break
+            elif c == "x":
+                raise AbortDeploy("x pressed")
+            elif c == "c":
+                self.pause_after = 1
+                break
+            elif c == "p":
+                min_percent = self.percent_complete() + 1
+
+                # Signal to renderer that we need percent prompt
+                self.needs_percent_prompt = True
+                prompt_input = yield self.console_input.raw_input('')
+                self.needs_percent_prompt = False
+
+                try:
+                    desired_percent = int(prompt_input)
+                except ValueError:
+                    continue
+
+                if not (min_percent <= desired_percent <= 100):
+                    continue
+
+                completed_hosts = self.count_completed_hosts()
+                desired_host_index = int(
+                    (desired_percent / 100) * self.count_hosts())
+                self.pause_after = desired_host_index - completed_hosts
+                break
+
+        self.enqueued_hosts = 0
+
+    def _draw_box(self, row, col, width, height):
+        # Top
+        print at_position('+' + '-' * (width - 2) + '+', row, col)
+
+        # Left Side
+        for i in xrange(row + 1, row + height - 1):
+            print at_position('|', i, col)
+
+        # Right Side
+        for i in xrange(row + 1, row + height - 1):
+            print at_position('|', i, col + width - 1)
+
+        # Bottom
+        print at_position('+' + '-' * (width - 2) + '+', row + height - 1, col)
+
+    def on_render(self):
+        print clear_screen()
+
+        # Describes the inner bounding box (i.e. where the hosts will be drawn
+        # and animated
+        row, col = 2, 2
+        max_row, max_col = min(max(self.parallel, 15), 30), 120
+
+        # Draw main bounding box
+        self._draw_box(row - 1, col - 1, max_col + 1, max_row + 1)
+
+        for host, count in self.host_ticks.iteritems():
+
+            # Calculate what we'll put on screen
+            num_chars_onscreen = max(max_col - count - 1, 0)
+
+            if num_chars_onscreen:
+                sliced_host = host[:num_chars_onscreen]
+
+                # Color the host
+                if not self.host_results[host]:
+                    colored_host = sliced_host
+                elif self.host_results[host] == 'success':
+                    colored_host = colorize(sliced_host, Color.GREEN)
+                elif self.host_results[host] == 'warning':
+                    colored_host = colorize(sliced_host, Color.YELLOW)
+                elif self.host_results[host] == 'error':
+                    colored_host = colorize(sliced_host, Color.RED)
+
+                # Put on screen
+                print at_position(colored_host, row, col + count)
+
+                self.host_ticks[host] += 1
+
+            row += 1
+            if row > max_row:
+                row = 2
+
+        # Show status count boxes
+        counter = collections.Counter(self.host_results.values())
+        WIDTH = 10
+        self._draw_box(row=max_row + 1, col=1, width=WIDTH, height=3)
+        print at_position(colorize(str(counter['success']), Color.GREEN),
+                          row=max_row + 2, col=3)
+        self._draw_box(row=max_row + 1, col=2 + WIDTH, width=WIDTH, height=3)
+        print at_position(colorize(str(counter['warning']), Color.YELLOW),
+                          row=max_row + 2, col=4 + WIDTH)
+        self._draw_box(
+            row=max_row + 1, col=3 + WIDTH * 2, width=WIDTH, height=3)
+        print at_position(colorize(str(counter['error']), Color.RED),
+                          row=max_row + 2, col=5 + WIDTH * 2)
+
+        # Show prompts if necessary
+        if getattr(self, 'needs_main_prompt', False):
+            print at_position(colorize(
+                "*** waiting for input: e[x]it, [c]ontinue, [a]ll remaining, "
+                "[p]ercentage", Color.BOLD(Color.CYAN)),
+                row=max_row + 1 + 3 + 1, col=1)
+        if getattr(self, 'needs_percent_prompt', False):
+            min_percent = self.percent_complete() + 1
+            prompt = "how far? (%d-100) " % min_percent
+            print at_position(prompt, row=max_row + 1 + 3 + 1, col=1)
+
+    def on_host_begin(self, host):
+        self.host_ticks[host] += 1
+
+    def on_host_end(self, host):
+        if host in self.host_results:
+            self.host_results[host] = "success"

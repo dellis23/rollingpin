@@ -1,10 +1,13 @@
 import ConfigParser
 import os
 import sys
+import time
 
+from twisted.internet import task
 from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.internet.task import react
 
+from . import frontends
 from .args import make_arg_parser, construct_canonical_commandline
 from .config import (
     coerce_and_validate_config,
@@ -14,7 +17,6 @@ from .config import (
 )
 from .deploy import Deployer, DeployError
 from .eventbus import EventBus
-from .frontends import HeadlessFrontend, HeadfulFrontend
 from .harold import enable_harold_notifications
 from .hostlist import (
     HostlistError,
@@ -137,6 +139,14 @@ def _select_hosts(config, args):
     returnValue(selected_hosts)
 
 
+def _fire_render_event(reactor, event_bus):
+    WANTED_FRAME_RATE = 0.1  # One frame per 100 ms
+    st = time.time()
+    event_bus.trigger('render')
+    sleep_time = max(WANTED_FRAME_RATE - (time.time() - st), 0)
+    reactor.callLater(sleep_time, _fire_render_event, reactor, event_bus)
+
+
 @inlineCallbacks
 def _main(reactor, *raw_args):
     config = _load_configuration()
@@ -158,9 +168,13 @@ def _main(reactor, *raw_args):
         enable_graphite_notifications(config, event_bus, args.components)
 
     if os.isatty(sys.stdout.fileno()):
-        HeadfulFrontend(event_bus, hosts, args.verbose_logging, args.pause_after)
+        FrontendClass = getattr(frontends, args.frontend_class)
+        FrontendClass(event_bus, hosts, args)
     else:
-        HeadlessFrontend(event_bus, hosts, args.verbose_logging)
+        frontends.HeadlessFrontend(event_bus, hosts, args)
+
+    # Set up animation events
+    reactor.callLater(0.1, _fire_render_event, reactor, event_bus)
 
     # execute
     if args.list_hosts:
