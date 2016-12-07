@@ -3,6 +3,7 @@ from __future__ import division
 
 import collections
 import logging
+import re
 import sys
 import termios
 import time
@@ -294,6 +295,57 @@ class OrderedDefaultDict(collections.OrderedDict, collections.defaultdict):
         self.default_factory = default_factory
 
 
+class RenderNode(object):
+
+    def __init__(self, col, text):
+        self.col = col
+        self.text = text
+
+    def _strip_ansi(self, text):
+        # Strip color
+        text = re.sub('\033' + r'\[[\d]+m(.*)', r'\1', text)
+        # Strip ansi ends
+        text = text.replace("\033[0m", "")
+        return text
+
+    def __len__(self):
+        return len(self._strip_ansi(self.text))
+
+
+class RenderFrame(object):
+
+    def __init__(self):
+        self.grid = []
+
+    def add(self, text, row, col):
+
+        # Extend the grid
+        if len(self.grid) < row:
+            needed_rows = row - len(self.grid)
+            self.grid.extend(([],) * needed_rows)
+
+        # Add the node
+        self.grid[row - 1].append(RenderNode(col, text))
+
+    def write_to_screen(self):
+        for row in self.grid:
+            to_print = ''
+            sorted_nodes = sorted(row, key=lambda x: x.col)
+
+            # Build a string of what should be printed for this row, filling in
+            # spaces where needed.
+            i = 0
+            for node in sorted_nodes:
+                spaces_needed = max(0, node.col - i)
+                if spaces_needed:
+                    to_print += ' ' * spaces_needed
+                    i += spaces_needed
+                to_print += node.text
+                i += len(node)
+
+            print to_print
+
+
 class AnimatedFrontend(HeadfulFrontend):
 
     def __init__(self, event_bus, hosts, args):
@@ -363,20 +415,20 @@ class AnimatedFrontend(HeadfulFrontend):
 
         self.enqueued_hosts = 0
 
-    def _draw_box(self, row, col, width, height):
+    def _draw_box(self, render_frame, row, col, width, height):
         # Top
-        print at_position('+' + '-' * (width - 2) + '+', row, col)
+        render_frame.add('+' + '-' * (width - 2) + '+', row, col)
 
         # Left Side
         for i in xrange(row + 1, row + height - 1):
-            print at_position('|', i, col)
+            render_frame.add('|', i, col)
 
         # Right Side
         for i in xrange(row + 1, row + height - 1):
-            print at_position('|', i, col + width - 1)
+            render_frame.add('|', i, col + width - 1)
 
         # Bottom
-        print at_position('+' + '-' * (width - 2) + '+', row + height - 1, col)
+        render_frame.add('+' + '-' * (width - 2) + '+', row + height - 1, col)
 
     def on_render(self):
         print clear_screen()
@@ -387,7 +439,8 @@ class AnimatedFrontend(HeadfulFrontend):
         max_row, max_col = min(max(self.parallel, 15), 30), 120
 
         # Draw main bounding box
-        self._draw_box(row - 1, col - 1, max_col + 1, max_row + 1)
+        render_frame = RenderFrame()
+        self._draw_box(render_frame, row - 1, col - 1, max_col + 1, max_row + 1)
 
         for host, count in self.host_ticks.iteritems():
 
@@ -408,7 +461,7 @@ class AnimatedFrontend(HeadfulFrontend):
                     colored_host = colorize(sliced_host, Color.RED)
 
                 # Put on screen
-                print at_position(colored_host, row, col + count)
+                render_frame.add(colored_host, row, col + count)
 
                 self.host_ticks[host] += 1
 
@@ -419,16 +472,23 @@ class AnimatedFrontend(HeadfulFrontend):
         # Show status count boxes
         counter = collections.Counter(self.host_results.values())
         WIDTH = 10
-        self._draw_box(row=max_row + 1, col=1, width=WIDTH, height=3)
-        print at_position(colorize(str(counter['success']), Color.GREEN),
-                          row=max_row + 2, col=3)
-        self._draw_box(row=max_row + 1, col=2 + WIDTH, width=WIDTH, height=3)
-        print at_position(colorize(str(counter['warning']), Color.YELLOW),
-                          row=max_row + 2, col=4 + WIDTH)
+        render_frame = RenderFrame()
+        self._draw_box(render_frame, row=max_row + 1, col=1, width=WIDTH,
+                       height=3)
+        render_frame.add(
+            colorize(str(counter['success']), Color.GREEN), max_row + 2, 3)
+        self._draw_box(render_frame, row=max_row + 1, col=2 + WIDTH,
+                       width=WIDTH, height=3)
+        render_frame.add(
+            colorize(str(counter['warning']), Color.YELLOW),
+            max_row + 2, 4 + WIDTH)
         self._draw_box(
-            row=max_row + 1, col=3 + WIDTH * 2, width=WIDTH, height=3)
-        print at_position(colorize(str(counter['error']), Color.RED),
-                          row=max_row + 2, col=5 + WIDTH * 2)
+            render_frame, row=max_row + 1, col=3 + WIDTH * 2, width=WIDTH,
+            height=3)
+        render_frame.add(
+            colorize(str(counter['error']), Color.RED),
+            max_row + 2, 5 + WIDTH * 2)
+        render_frame.write_to_screen()
 
         # Show prompts if necessary
         if getattr(self, 'needs_main_prompt', False):
